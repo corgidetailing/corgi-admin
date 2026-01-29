@@ -5,7 +5,7 @@ import Loading from "../components/Loading";
 import {
   getMaterialsForRuleVersion,
   getPpfBundles,
-  getPpfPricingRules,
+  getPpfPricingRule,
   getQuoteById,
   getRollSkusForMaterial,
   replacePpfLineItems,
@@ -49,7 +49,7 @@ export default function PpfBuilderPage() {
         const q = await getQuoteById(quoteId);
         const rv = q.rule_version_id;
         const [rules, bs, mats] = await Promise.all([
-          getPpfPricingRules(rv),
+          getPpfPricingRule(rv),
           getPpfBundles(rv),
           getMaterialsForRuleVersion(rv),
         ]);

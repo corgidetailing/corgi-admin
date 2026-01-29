@@ -1,19 +1,12 @@
-// src/lib/api.js
 import { supabase } from "./supabaseClient";
 
-/* ----------------------------- small utilities ---------------------------- */
+/* =========================================================================
+   1. UTILITIES & HELPERS
+   ========================================================================= */
 
 function n(v, fallback = 0) {
   const x = Number(v);
   return Number.isFinite(x) ? x : fallback;
-}
-
-function asArray(v) {
-  if (Array.isArray(v)) return v;
-  if (v && Array.isArray(v.data)) return v.data;
-  if (v && Array.isArray(v.rows)) return v.rows;
-  if (v && Array.isArray(v.items)) return v.items;
-  return [];
 }
 
 function uniq(arr) {
@@ -26,53 +19,16 @@ function throwSupabase(error, context = "Supabase error") {
   throw new Error(`${context}: ${msg}`);
 }
 
-function isMissingTableOrView(error) {
-  const msg = String(error?.message || "");
-  return msg.includes("Could not find the table") || msg.includes("schema cache");
-}
-
-function isMissingColumn(error, colName) {
-  const msg = String(error?.message || "").toLowerCase();
-  if (!msg.includes("does not exist")) return false;
-  if (!msg.includes("column")) return false;
-  if (!colName) return true;
-  const c = String(colName).toLowerCase();
-  return msg.includes(`.${c}`) || msg.includes(` ${c} `) || msg.includes(`"${c}"`) || msg.includes(`'${c}'`);
-}
-
-async function requireUserId() {
-  const { data, error } = await supabase.auth.getUser();
-  throwSupabase(error, "Auth getUser failed");
-  const uid = data?.user?.id;
-  if (!uid) throw new Error("You must be logged in.");
-  return uid;
-}
-
-async function tryRpc(names, args) {
-  for (const fn of names) {
-    const { data, error } = await supabase.rpc(fn, args);
-    if (!error) return data;
-  }
-  return null;
-}
-
-async function safeFrom(table, queryFn, fallbackValue) {
-  const q = queryFn(supabase.from(table));
-  const { data, error } = await q;
-  if (error) {
-    if (isMissingTableOrView(error)) return fallbackValue;
-    throwSupabase(error, `Failed query on ${table}`);
-  }
-  return data ?? fallbackValue;
-}
-
-/* --------------------------------- QUOTES -------------------------------- */
+/* =========================================================================
+   2. CORE QUOTE FUNCTIONS (CRUD)
+   ========================================================================= */
 
 export async function createQuote({ ruleVersionId = null } = {}) {
-  const createdBy = await requireUserId();
+  const { data: { user } } = await supabase.auth.getUser();
+  const uid = user?.id;
 
   const payload = {
-    created_by: createdBy,
+    created_by: uid,
     rule_version_id: ruleVersionId,
     totals: {
       inputs: {},
@@ -92,474 +48,227 @@ export async function createQuote({ ruleVersionId = null } = {}) {
 }
 
 export async function getQuoteById(quoteId) {
-  if (!quoteId) throw new Error("getQuoteById: quoteId is required");
-
+  if (!quoteId) throw new Error("quoteId is required");
   const { data, error } = await supabase.from("quotes").select("*").eq("id", quoteId).single();
   throwSupabase(error, "Failed to load quote");
   return data;
 }
 
 export async function listRecentQuotes({ limit = 25 } = {}) {
-  const lim = Math.max(1, Math.min(200, n(limit, 25)));
-
   const { data, error } = await supabase
     .from("quotes")
-    .select("id, created_at, rule_version_id, totals, warnings")
+    .select("id, client_name, created_at, rule_version_id, totals")
     .order("created_at", { ascending: false })
-    .limit(lim);
-
+    .limit(limit);
   throwSupabase(error, "Failed to list recent quotes");
   return data || [];
 }
 
-export async function updateQuoteTotals({ quoteId, totals, warnings = [] }) {
-  if (!quoteId) throw new Error("updateQuoteTotals: quoteId is required");
-
-  const patch = { totals: totals ?? {}, warnings: warnings ?? [] };
-
-  const { data, error } = await supabase.from("quotes").update(patch).eq("id", quoteId).select("*").single();
+export async function updateQuoteTotals({ quoteId, totals }) {
+  const { data, error } = await supabase
+    .from("quotes")
+    .update({ totals })
+    .eq("id", quoteId)
+    .select()
+    .single();
   throwSupabase(error, "Failed to update quote totals");
   return data;
 }
 
-/* ----------------------------- QUOTE LINE ITEMS --------------------------- */
-
 export async function listQuoteLineItems(quoteId) {
-  if (!quoteId) throw new Error("listQuoteLineItems: quoteId is required");
-
   const { data, error } = await supabase
     .from("quote_line_items")
     .select("*")
     .eq("quote_id", quoteId)
     .order("sort_order", { ascending: true })
     .order("created_at", { ascending: true });
-
   throwSupabase(error, "Failed to list quote line items");
   return data || [];
 }
 
-async function replaceFamilyLineItems({ quoteId, family, items }) {
-  if (!quoteId) throw new Error("replaceFamilyLineItems: quoteId is required");
-  if (!family) throw new Error("replaceFamilyLineItems: family is required");
+/* =========================================================================
+   3. DASHBOARD HELPERS
+   ========================================================================= */
 
-  const safeItems = Array.isArray(items) ? items : [];
-
-  const del = await supabase.from("quote_line_items").delete().eq("quote_id", quoteId).eq("family", family);
-  throwSupabase(del.error, `Failed to clear ${family} line items`);
-
-  if (!safeItems.length) return [];
-
-  const insertRows = safeItems.map((it, idx) => ({
-    quote_id: quoteId,
-    service_item_id: it.service_item_id ?? null,
-    family,
-    zone: it.zone,
-    name: it.name,
-    is_main: Boolean(it.is_main),
-    is_standalone: Boolean(it.is_standalone),
-    sort_order: n(it.sort_order, idx * 10),
-    inputs: it.inputs ?? {},
-    calc: it.calc ?? {},
-  }));
-
-  const ins = await supabase.from("quote_line_items").insert(insertRows).select("*");
-  throwSupabase(ins.error, `Failed to insert ${family} line items`);
-  return ins.data || [];
-}
-
-export async function replacePpfLineItems({ quoteId, items }) {
-  return replaceFamilyLineItems({ quoteId, family: "PPF", items });
-}
-
-export async function replaceCeramicLineItems({ quoteId, items }) {
-  return replaceFamilyLineItems({ quoteId, family: "CERAMIC", items });
-}
-
-export async function replaceSwissvaxLineItems({ quoteId, items }) {
-  return replaceFamilyLineItems({ quoteId, family: "SWISSVAX", items });
-}
-
-/* ---------------------------------- PPF ---------------------------------- */
-
-export async function getPpfPricingRule(ruleVersionId) {
-  if (!ruleVersionId) return null;
-
-  const rpc = await tryRpc(["get_ppf_pricing_rule", "ppf_get_pricing_rule", "get_ppf_rule"], {
-    rule_version_id: ruleVersionId,
-  });
-  if (rpc) return rpc;
-
+export async function getActiveRuleVersionId() {
   const { data, error } = await supabase
-    .from("ppf_pricing_rules")
-    .select("*")
-    .eq("rule_version_id", ruleVersionId)
-    .order("updated_at", { ascending: false })
-    .limit(1);
-
-  if (error) {
-    if (isMissingTableOrView(error)) return null;
-    throwSupabase(error, "Failed to load PPF pricing rule");
-  }
-  return (data && data[0]) || null;
+    .from("rule_versions")
+    .select("id")
+    .eq("is_active", true)
+    .maybeSingle();
+  if (error) { console.error("getActiveRuleVersionId error", error); return null; }
+  return data?.id;
 }
 
-export async function getPpfBundles(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const rpc = await tryRpc(["get_ppf_bundles", "list_ppf_bundles", "ppf_list_bundles"], {
+export async function createDraftQuote({ userId, ruleVersionId, vehicle, color, notes, size_code, difficulty, size_difficulty_multiplier }) {
+  const payload = {
+    created_by: userId,
     rule_version_id: ruleVersionId,
-  });
-  if (rpc) return asArray(rpc);
-
-  const rows = await safeFrom(
-    "ppf_bundles",
-    (t) =>
-      t.select("*")
-        .eq("rule_version_id", ruleVersionId)
-        .eq("active", true)
-        .order("sort_order", { ascending: true }),
-    []
-  );
-  return rows || [];
-}
-
-export async function getPpfBundlePricing(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const rpc = await tryRpc(["get_ppf_bundle_pricing", "list_ppf_bundle_pricing", "ppf_list_bundle_pricing"], {
-    rule_version_id: ruleVersionId,
-  });
-  if (rpc) return asArray(rpc);
-
-  const rows = await safeFrom("ppf_bundle_pricing", (t) => t.select("*").eq("rule_version_id", ruleVersionId), []);
-  return rows || [];
-}
-
-/**
- * IMPORTANT FIX:
- * - do NOT filter `.active` because your roll_skus table doesn't have it
- * - return array of strings (material codes) because QuoteBuilder expects strings
- */
-export async function getMaterialsForRuleVersion(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const tryTables = ["ppf_roll_skus", "roll_skus"];
-  for (const table of tryTables) {
-    const { data, error } = await supabase.from(table).select("material_code").eq("rule_version_id", ruleVersionId);
-    if (!error) {
-      const codes = uniq((data || []).map((r) => String(r.material_code || "").trim()).filter(Boolean));
-      return codes.sort((a, b) => a.localeCompare(b));
+    status: 'DRAFT',
+    client_name: vehicle || "New Quote", 
+    vehicle_notes: [color, notes].filter(Boolean).join(" | "),
+    totals: {
+      inputs: { size_code, difficulty, size_difficulty_multiplier, color },
+      ppf: { subtotal_mxn: 0, count: 0 },
+      ceramic: { subtotal_mxn: 0, count: 0 },
+      swissvax: { subtotal_mxn: 0, count: 0 },
+      tint: { subtotal_mxn: 0, count: 0 },
+      grand_total_mxn: 0,
+      warnings: []
     }
-    if (!isMissingTableOrView(error)) throwSupabase(error, `Failed to load PPF materials (${table})`);
-  }
+  };
 
-  return [];
-}
-
-/**
- * IMPORTANT FIX:
- * QuoteBuilder expects: { widths: number[], skuByWidth: { [width]: skuRow } }
- */
-export async function getWidthOptionsForMaterial(ruleVersionId, materialCode) {
-  if (!ruleVersionId) throw new Error("getWidthOptionsForMaterial: ruleVersionId is required");
-  if (!materialCode) return { widths: [], skuByWidth: {} };
-
-  const tryTables = ["ppf_roll_skus", "roll_skus"];
-
-  for (const table of tryTables) {
-    const { data, error } = await supabase
-      .from(table)
-      .select("*")
-      .eq("rule_version_id", ruleVersionId)
-      .eq("material_code", materialCode);
-
-    if (error) {
-      if (isMissingTableOrView(error)) continue;
-      throwSupabase(error, `Failed to load roll SKUs (${table})`);
-    }
-
-    const rows = data || [];
-
-    // choose best row per width (prefer warning_only=false)
-    const skuByWidth = {};
-    for (const r of rows) {
-      const w = n(r.width_in, NaN);
-      if (!Number.isFinite(w)) continue;
-
-      const cur = skuByWidth[w];
-      if (!cur) {
-        skuByWidth[w] = r;
-        continue;
-      }
-      const curWarn = Boolean(cur.warning_only);
-      const nextWarn = Boolean(r.warning_only);
-      if (curWarn && !nextWarn) skuByWidth[w] = r;
-    }
-
-    const widths = Object.keys(skuByWidth)
-      .map((k) => Number(k))
-      .filter((x) => Number.isFinite(x))
-      .sort((a, b) => a - b);
-
-    return { widths, skuByWidth };
-  }
-
-  return { widths: [], skuByWidth: {} };
+  const { data, error } = await supabase.from("quotes").insert(payload).select("*").single();
+  if (error) throw new Error(error.message);
+  return data;
 }
 
 export async function listSizeDifficultyMultipliers(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("size_difficulty_multipliers")
     .select("*")
-    .eq("rule_version_id", ruleVersionId);
-
-  if (error) {
-    if (isMissingTableOrView(error)) return [];
-    throwSupabase(error, "Failed to load size/difficulty multipliers");
-  }
-  return data || [];
-}
-
-export async function getPpfLaborRates(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const tryTables = ["ppf_labor_rates"];
-  for (const table of tryTables) {
-    const { data, error } = await supabase
-      .from(table)
-      .select("*")
-      .eq("rule_version_id", ruleVersionId)
-      .eq("active", true)
-      .order("sort_order", { ascending: true });
-
-    if (!error) return data || [];
-    if (!isMissingTableOrView(error)) throwSupabase(error, `Failed to load PPF labor rates (${table})`);
-  }
-
-  return [];
-}
-
-/* -------------------------------- CERAMIC / SWISSVAX --------------------- */
-
-export async function getCeramicPricingRule(ruleVersionId) {
-  if (!ruleVersionId) return null;
-
-  const { data, error } = await supabase
-    .from("ceramic_pricing_rules")
-    .select("*")
     .eq("rule_version_id", ruleVersionId)
-    .order("updated_at", { ascending: false })
-    .limit(1);
-
-  throwSupabase(error, "Failed to load ceramic pricing rule");
-  return (data && data[0]) || null;
-}
-
-export async function listCeramicSystems(ruleVersionId) {
-  if (!ruleVersionId) return [];
-
-  const { data, error } = await supabase
-    .from("ceramic_systems")
-    .select("*")
-    .eq("rule_version_id", ruleVersionId)
-    .eq("active", true)
-    .order("name", { ascending: true });
-
-  throwSupabase(error, "Failed to load ceramic systems");
+    .eq("is_active", true);
   return data || [];
 }
 
-/**
- * NOTE: allow calling with or without ruleVersionId
- */
-export async function listServiceOffersWithTemplate(ruleVersionId) {
-  const args = ruleVersionId ? { rule_version_id: ruleVersionId } : {};
-
-  const rpc = await tryRpc(["list_service_offers_with_template", "listServiceOffersWithTemplate"], args);
-  if (rpc) return asArray(rpc);
-
-  // fallback table-only: we don't have templates here, so we tag family by name
-  const { data, error } = await supabase
-    .from("service_offers")
-    .select("id, display_name, pricing_model, sort_order, protection_product_id, active")
-    .eq("active", true)
-    .order("sort_order", { ascending: true });
-
-  if (error) {
-    if (isMissingTableOrView(error)) return [];
-    throwSupabase(error, "Failed to load service offers (fallback)");
-  }
-
-  return (data || []).map((r) => {
-    const dn = String(r.display_name || "").toLowerCase();
-    const family = dn.includes("swissvax") ? "swissvax" : "ceramic";
-    return {
-      id: r.id,
-      display_name: r.display_name,
-      pricing_model: r.pricing_model,
-      sort_order: r.sort_order,
-      protection_product_id: r.protection_product_id ?? null,
-      service_templates: { family, name: "" },
-    };
-  });
-}
-
-export async function getProductsByIds(ids) {
-  const list = uniq((ids || []).filter(Boolean));
-  if (!list.length) return [];
-
-  const { data, error } = await supabase.from("products").select("*").in("id", list);
-  throwSupabase(error, "Failed to load products");
-  return data || [];
-}
-
-export async function listOfferSurfacesByOfferIds(offerIds) {
-  const list = uniq((offerIds || []).filter(Boolean));
-  if (!list.length) return [];
-
-  const { data, error } = await supabase.from("offer_surfaces").select("*").in("service_offer_id", list);
-  throwSupabase(error, "Failed to load offer surfaces");
-  return data || [];
-}
-
-export async function listOfferUsageMlByOfferIds(offerIds) {
-  const list = uniq((offerIds || []).filter(Boolean));
-  if (!list.length) return [];
-
-  const { data, error } = await supabase.from("offer_usage_ml").select("*").in("service_offer_id", list);
-  throwSupabase(error, "Failed to load offer usage (ml)");
-  return data || [];
-}
-
-export async function listOfferPricingBySizeByOfferIds(offerIds) {
-  const list = uniq((offerIds || []).filter(Boolean));
-  if (!list.length) return [];
-
-  // some schemas do not have offer_pricing_by_size.active → retry without it
-  const first = await supabase
-    .from("offer_pricing_by_size")
-    .select("*")
-    .in("service_offer_id", list)
-    .eq("active", true);
-
-  if (!first.error) return first.data || [];
-
-  if (isMissingColumn(first.error, "active")) {
-    const retry = await supabase.from("offer_pricing_by_size").select("*").in("service_offer_id", list);
-    throwSupabase(retry.error, "Failed to load offer pricing by size");
-    return retry.data || [];
-  }
-
-  throwSupabase(first.error, "Failed to load offer pricing by size");
-}
-/* ----------------------------- PREP / TINT / ADDONS ---------------------- */
+/* =========================================================================
+   4. STEP 2: PREP
+   ========================================================================= */
 
 export async function listStandalonePrepPrices(ruleVersionId) {
   if (!ruleVersionId) return [];
+  // Try newer table first
   const { data, error } = await supabase
     .from("correction_standalone_prices")
     .select("*, correction_packages(*)")
     .eq("rule_version_id", ruleVersionId);
   
-  if (error) { console.error("listStandalonePrepPrices", error); return []; }
-  return data || [];
-}
+  if (!error && data) return data;
 
-export async function listTintOptions(ruleVersionId) {
-  if (!ruleVersionId) return [];
-  // Fetch films and prices manually or via join if relations exist
-  const { data: films } = await supabase
-    .from("tint_films")
-    .select("*")
+  // Fallback to older table
+  const { data: fallback } = await supabase
+    .from("prep_prices")
+    .select("*, correction_packages(*)")
     .eq("rule_version_id", ruleVersionId)
-    .eq("active", true)
-    .order("sort_order");
-
-  if (!films?.length) return [];
-
-  const { data: prices } = await supabase
-    .from("tint_prices")
-    .select("*")
-    .in("tint_film_id", films.map(f => f.id));
-
-  // Merge them for the UI
-  return films.map(f => ({
-    ...f,
-    prices: prices.filter(p => p.tint_film_id === f.id)
-  }));
+    .eq("is_active", true)
+    .order("price_mxn");
+  return fallback || [];
 }
 
-export async function listAddons(ruleVersionId) {
-  if (!ruleVersionId) return [];
-  const { data, error } = await supabase
-    .from("addons_catalog")
-    .select("*")
-    .eq("rule_version_id", ruleVersionId)
-    .eq("active", true)
-    .order("sort_order");
-
-  if (error) return [];
-  return data || [];
-}
-
-// Helpers to save line items
-export async function replaceTintLineItems({ quoteId, items }) {
-  // Assuming you have a generic replaceFamilyLineItems function in your api.js
-  // If not, use the same logic as replacePpfLineItems but change family to 'TINT'
-  return replaceFamilyLineItems({ quoteId, family: "TINT", items });
-}
-
-export async function replaceAddonLineItems({ quoteId, items }) {
-  return replaceFamilyLineItems({ quoteId, family: "ADDON", items });
-}
-
-// NOTE: For Prep, we usually store it as a line item with family='PREP' or 'DET'
 export async function savePrepLineItem({ quoteId, item }) {
-  // Clear existing prep
   await supabase.from("quote_line_items").delete().eq("quote_id", quoteId).eq("family", "PREP");
-  
-  if (!item) return; // If clearing, stop here
-
-  const { error } = await supabase.from("quote_line_items").insert({
-    quote_id: quoteId,
-    family: "PREP",
-    zone: "EXTERIOR",
-    name: item.name,
-    is_main: false,
-    inputs: item.inputs,
-    calc: item.calc
-  });
-  if (error) throw error;
+  if (item) {
+    await supabase.from("quote_line_items").insert({
+      quote_id: quoteId,
+      family: "PREP",
+      zone: "EXTERIOR",
+      name: item.name,
+      is_main: true,
+      inputs: item.inputs,
+      calc: item.calc,
+      sort_order: 5
+    });
+  }
 }
-/* ----------------------------- STEP 3: PPF CALCULATOR --------------------- */
 
-// 1. GET KITS (For the "Easy" Table)
+/* =========================================================================
+   5. STEP 3: PPF (CALCULATOR & ROLLS)
+   ========================================================================= */
+
+export async function getPpfPricingRule(ruleVersionId) {
+  const { data } = await supabase.from("ppf_pricing_rules").select("*").eq("rule_version_id", ruleVersionId).single();
+  return data;
+}
+
 export async function getPpfBundles(ruleVersionId) {
-  if (!ruleVersionId) return [];
-  
-  // We fetch templates and their pricing in one go if possible, 
-  // or just fetch templates and we will match pricing later.
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("bundle_templates")
-    .select(`
-      *,
-      ppf_bundle_pricing!inner(*) 
-    `)
+    .select(`*, ppf_bundle_pricing!inner(*)`)
     .eq("rule_version_id", ruleVersionId)
+    .eq("family", "PPF")
     .eq("active", true)
-    .eq("ppf_bundle_pricing.is_active", true)
-    .order("code", { ascending: true });
-
-  if (error) { console.error("getPpfBundles error", error); return []; }
+    .order("sort_order");
   return data || [];
 }
 
-// 2. GET ROLL WIDTHS (For "Complex" Dropdown)
+export async function getPpfBundlePricing(ruleVersionId) {
+  const { data } = await supabase.from("ppf_bundle_pricing").select("*").eq("rule_version_id", ruleVersionId).eq("is_active", true);
+  return data;
+}
+
+export async function getMaterialsForRuleVersion(ruleVersionId) {
+  if (!ruleVersionId) return [];
+  
+  // 1. Try strict "ppf_roll_skus"
+  let { data } = await supabase
+    .from("ppf_roll_skus")
+    .select("material_code")
+    .eq("rule_version_id", ruleVersionId);
+
+  // 2. If empty, try "roll_skus"
+  if (!data || data.length === 0) {
+     const { data: d2 } = await supabase
+       .from("roll_skus")
+       .select("material_code")
+       .eq("rule_version_id", ruleVersionId);
+     if (d2) data = d2;
+  }
+
+  // 3. If STILL empty, try ignore rule_version_id (Just get ANY material)
+  if (!data || data.length === 0) {
+     console.warn("Trying global material lookup...");
+     const { data: d3 } = await supabase
+       .from("ppf_roll_skus")
+       .select("material_code")
+       .limit(50);
+     if (d3) data = d3;
+  }
+
+  // 4. Final attempt: 'roll_skus' global
+  if (!data || data.length === 0) {
+     const { data: d4 } = await supabase
+       .from("roll_skus")
+       .select("material_code")
+       .limit(50);
+     if (d4) data = d4;
+  }
+
+  if (!data) return [];
+
+  // Deduplicate & Sort
+  const codes = [...new Set(data.map(r => r.material_code).filter(Boolean))];
+  return codes.sort();
+}
+
+export async function getRollSkusForMaterial({ ruleVersionId, materialCode }) {
+  if (!ruleVersionId) throw new Error("getRollSkusForMaterial: ruleVersionId is required");
+  
+  const { data, error } = await supabase
+    .from("roll_skus") 
+    .select("*")
+    .eq("rule_version_id", ruleVersionId)
+    .eq("material_code", materialCode)
+    .eq("is_active", true)
+    .order("width_in", { ascending: true });
+
+  if (error) {
+    const { data: data2 } = await supabase
+      .from("ppf_roll_skus")
+      .select("*")
+      .eq("rule_version_id", ruleVersionId)
+      .eq("material_code", materialCode)
+      .eq("is_active", true)
+      .order("width_in", { ascending: true });
+    return { selectable: data2 || [] };
+  }
+  
+  return { selectable: data || [] };
+}
+
 export async function getRollWidths(ruleVersionId, materialCode) {
   const { data } = await supabase
-    .from("roll_skus")
+    .from("ppf_roll_skus")
     .select("width_in, max_length_in")
     .eq("rule_version_id", ruleVersionId)
     .eq("material_code", materialCode)
@@ -569,11 +278,75 @@ export async function getRollWidths(ruleVersionId, materialCode) {
   return data || [];
 }
 
-// 3. THE CALCULATOR ENGINE (Calls your SQL function)
+/* --- ROBUST WIDTH FINDER --- */
+export async function getWidthOptionsForMaterial(ruleVersionId, materialCode) {
+  // 1. Try strict lookup first (Best Case)
+  let { data } = await supabase
+    .from("ppf_roll_skus")
+    .select("*")
+    .eq("rule_version_id", ruleVersionId)
+    .eq("material_code", materialCode)
+    .order("width_in");
+
+  // 2. If empty, try legacy table 'roll_skus'
+  if (!data || data.length === 0) {
+     const { data: d2 } = await supabase
+       .from("roll_skus")
+       .select("*")
+       .eq("rule_version_id", ruleVersionId)
+       .eq("material_code", materialCode)
+       .order("width_in");
+     if (d2) data = d2;
+  }
+
+  // 3. (THE FIX) If STILL empty, ignore rule_version_id and just find ANY width for this material
+  // This fixes the "I see the material but no sizes" bug
+  if (!data || data.length === 0) {
+     console.warn(`No widths found for ${materialCode} in version ${ruleVersionId}. Trying global lookup...`);
+     
+     // Try global ppf_roll_skus
+     const { data: d3 } = await supabase
+       .from("ppf_roll_skus")
+       .select("*")
+       .eq("material_code", materialCode)
+       .order("width_in");
+       
+     if (d3 && d3.length > 0) {
+       data = d3;
+     } else {
+       // Try global roll_skus
+       const { data: d4 } = await supabase
+         .from("roll_skus")
+         .select("*")
+         .eq("material_code", materialCode)
+         .order("width_in");
+       if (d4) data = d4;
+     }
+  }
+
+  if (!data) return { widths: [], skuByWidth: {} };
+
+  // Deduplicate widths (in case global lookup returned duplicates)
+  const skuByWidth = {};
+  const uniqueWidths = new Set();
+  
+  data.forEach(r => { 
+    const w = Number(r.width_in);
+    if (!uniqueWidths.has(w)) {
+      uniqueWidths.add(w);
+      skuByWidth[w] = r;
+    }
+  });
+
+  const widths = Array.from(uniqueWidths).sort((a,b) => a - b);
+  
+  return { widths, skuByWidth };
+}
+
 export async function calculatePpfPrice({ ruleVersionId, materialCode, width, length, hours, sizeCode, difficulty }) {
   const { data, error } = await supabase.rpc("ppf_calc_line_item", {
     p_rule_version_id: ruleVersionId,
-    p_bundle_template_id: "00000000-0000-0000-0000-000000000000", // You might need a "Dummy" bundle ID for custom work, or update the SQL function to allow NULL
+    p_bundle_template_id: "00000000-0000-0000-0000-000000000000",
     p_material_code: materialCode,
     p_width_in: Number(width),
     p_length_in: Number(length),
@@ -581,7 +354,138 @@ export async function calculatePpfPrice({ ruleVersionId, materialCode, width, le
     p_size_code: sizeCode,
     p_difficulty: Number(difficulty)
   });
-
   if (error) throw error;
-  return data; // Returns JSON with { final_price_mxn, cost_mxn, etc }
+  return data; 
 }
+
+export async function replacePpfLineItems({ quoteId, items }) {
+  await supabase.from("quote_line_items").delete().eq("quote_id", quoteId).eq("family", "PPF");
+  if (items.length === 0) return;
+  
+  const toInsert = items.map((i, idx) => ({
+    quote_id: quoteId,
+    family: "PPF",
+    zone: i.zone || "EXTERIOR",
+    name: i.name,
+    is_main: i.is_main,
+    sort_order: i.sort_order || (10 + idx),
+    inputs: i.inputs,
+    calc: i.calc
+  }));
+  await supabase.from("quote_line_items").insert(toInsert);
+}
+
+/* =========================================================================
+   6. CERAMIC, SWISSVAX, TINT & ADDONS (UNIVERSAL)
+   ========================================================================= */
+
+// 1. Fetch Packages (Deep Join)
+export async function listServicePackages(ruleVersionId, family) {
+  if (!ruleVersionId) return [];
+  const { data } = await supabase
+    .from("service_packages")
+    .select(`
+      *,
+      items:service_package_items (
+        layer_type,
+        service_offer:service_offers (
+          id, display_name, protection_product_id,
+          product:products ( name, brand, cost_mxn, volume_ml )
+        )
+      )
+    `)
+    .eq("rule_version_id", ruleVersionId)
+    .eq("family", family)
+    .order("sort_order");
+  return data || [];
+}
+
+// 2. Fetch Standalone Coatings (for Bespoke menus)
+export async function listAvailableCoatings(ruleVersionId, typeLike) {
+  const { data } = await supabase
+    .from("service_offers")
+    .select(`
+      id, display_name, protection_type,
+      product:products ( id, name, brand, cost_mxn, volume_ml )
+    `)
+    .eq("rule_version_id", ruleVersionId)
+    .eq("active", true)
+    .ilike("protection_type", `%${typeLike}%`);
+  return data || [];
+}
+
+// 3. Estimates Helper
+export async function getUsageEstimates(ruleVersionId) {
+  return {
+    ceramic: { S: 15, M: 25, L: 35, XL: 45 },
+    wax: { S: 10, M: 15, L: 20, XL: 25 }
+  };
+}
+
+// 4. Tint & Addons Lists
+export async function listTintOptions(ruleVersionId) {
+  if (!ruleVersionId) return [];
+  const { data: films } = await supabase.from("tint_films").select("*").eq("rule_version_id", ruleVersionId).eq("active", true).order("sort_order");
+  if (!films?.length) return [];
+  
+  const { data: prices } = await supabase.from("tint_prices").select("*").in("tint_film_id", films.map(f => f.id));
+  
+  return films.map(f => ({
+    ...f,
+    prices: prices.filter(p => p.tint_film_id === f.id)
+  }));
+}
+
+export async function listAddons(ruleVersionId) {
+  if (!ruleVersionId) return [];
+  const { data } = await supabase.from("addons_catalog").select("*").eq("rule_version_id", ruleVersionId).eq("active", true).order("sort_order");
+  return data || [];
+}
+
+export async function getPpfLaborRates(ruleVersionId) {
+  const { data } = await supabase.from("ppf_labor_rates").select("*").eq("rule_version_id", ruleVersionId).eq("active", true);
+  return data || [];
+}
+
+/* --- THE MASTER SAVE FUNCTION (FUTURE PROOF) --- */
+export async function replaceStandardLineItems({ quoteId, family, items }) {
+  if (!quoteId || !family) throw new Error("quoteId and family are required");
+
+  // 1. Delete existing items
+  const { error: delErr } = await supabase
+    .from("quote_line_items")
+    .delete()
+    .eq("quote_id", quoteId)
+    .eq("family", family);
+
+  if (delErr) throw delErr;
+
+  if (!items || items.length === 0) return;
+
+  // 2. Insert new items
+  const toInsert = items.map((item, idx) => ({
+    quote_id: quoteId,
+    family: family, 
+    zone: item.zone || "EXTERIOR",
+    name: item.name,
+    is_main: Boolean(item.is_main),
+    is_standalone: true, // Universal flag
+    // Standardize JSON calc storage
+    calc: item.calc || {},
+    inputs: item.inputs || {},
+    sort_order: (item.sort_order || 50) + idx
+  }));
+
+  const { error: insErr } = await supabase.from("quote_line_items").insert(toInsert);
+  
+  if (insErr) {
+    console.error(`Error saving ${family}:`, insErr);
+    throw insErr;
+  }
+}
+
+// Aliases for component compatibility
+export const replaceCeramicLineItems = (args) => replaceStandardLineItems({ ...args, family: "CERAMIC" });
+export const replaceSwissvaxLineItems = (args) => replaceStandardLineItems({ ...args, family: "SWISSVAX" });
+export const replaceTintLineItems = (args) => replaceStandardLineItems({ ...args, family: "TINT" });
+export const replaceAddonLineItems = (args) => replaceStandardLineItems({ ...args, family: "ADDON" });
