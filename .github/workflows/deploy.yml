@@ -3,7 +3,7 @@ name: Deploy to Hostinger
 on:
   push:
     branches:
-      - main  # Make sure this matches your branch name (main or master)
+      - main
 
 jobs:
   web-deploy:
@@ -23,6 +23,9 @@ jobs:
 
       - name: 🔨 Build Project
         run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
       - name: 📂 Upload to Hostinger
         uses: SamKirkland/FTP-Deploy-Action@v4.3.4
@@ -30,5 +33,5 @@ jobs:
           server: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
-          local-dir: ./dist/      # This is the folder Vite creates
+          local-dir: ./dist/
           server-dir: ./
